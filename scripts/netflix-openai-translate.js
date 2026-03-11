@@ -92,9 +92,10 @@ const CONFIG = {
 
     // Cache check — 用內容 hash 而非 URL（URL 每次不同但字幕內容一樣）
     const cacheKey = "nf_sub_" + simpleHash(body.substring(0, 512));
-    const cached = readCache(cacheKey);
+    const DEBUG_SKIP_CACHE = false; // 除錯時設 true 強制跑翻譯
+    const cached = !DEBUG_SKIP_CACHE && readCache(cacheKey);
     if (cached) {
-      console.log("[Netflix-Dualsub] Cache hit.");
+      console.log("[Netflix-Dualsub] Cache hit. Preview: " + cached.substring(0, 150).replace(/\n/g, "\\n"));
       $done({ body: cached });
       return;
     }
@@ -133,8 +134,10 @@ const CONFIG = {
 
     if (result) {
       writeCache(cacheKey, result);
+      console.log("[Netflix-Dualsub] Output preview: " + result.substring(0, 200).replace(/\n/g, "\\n"));
       $done({ body: result });
     } else {
+      console.log("[Netflix-Dualsub] No result, pass-through.");
       $done({});
     }
   } catch (e) {
