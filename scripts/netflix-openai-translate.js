@@ -20,10 +20,17 @@ function parseArguments() {
   const args = {};
   if (typeof $argument !== "undefined" && $argument) {
     $argument.split("&").forEach((pair) => {
-      const [k, v] = pair.split("=");
-      if (k && v !== undefined) args[decodeURIComponent(k)] = decodeURIComponent(v);
+      const eqIdx = pair.indexOf("=");
+      if (eqIdx === -1) return;
+      const k = decodeURIComponent(pair.substring(0, eqIdx).trim());
+      let v = decodeURIComponent(pair.substring(eqIdx + 1).trim());
+      // 去掉 Surge 傳入時可能帶的前後引號
+      v = v.replace(/^["']|["']$/g, "");
+      if (k) args[k] = v;
     });
   }
+  console.log("[Netflix-Dualsub] Arguments parsed: " + JSON.stringify(Object.keys(args)));
+  console.log("[Netflix-Dualsub] ApiKey prefix: " + (args["ApiKey"] || "").substring(0, 8));
   return args;
 }
 
