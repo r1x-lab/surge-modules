@@ -12,4 +12,3 @@ Netflix Subtitle Translate = type=http-response, pattern=^https?://([^/]+\.)?oca
 
 [MITM]
 hostname = %APPEND% *.oca.nflxvideo.net
-tcp-connection = true
