@@ -1,11 +1,16 @@
 /**
- * Netflix OpenAI Dualsub v2
+ * Netflix OpenAI Dualsub v2.1
  * Surge iOS Script (http-response)
  *
  * 核心策略（參考 Neurogram-R）：
  *   - 不重建 VTT，直接 regex 在原始 body 插入譯文
  *   - 去重翻譯，平行分組送 OpenAI
  *   - $persistentStore 快取（內容 hash）
+ *
+ * v2.1 變更：
+ *   - 拆行合併改 while loop，正確處理 3+ 行字幕
+ *   - 純 CC 標記（[MUSIC] / [APPLAUSE] 等）不送翻譯，直接保留原文
+ *   - 去重 key normalize（trim + 壓縮空白），避免空白差異造成重複翻譯
  */
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -18,7 +23,7 @@ function parseArguments() {
       if (eqIdx === -1) return;
       const k = decodeURIComponent(pair.substring(0, eqIdx).trim());
       let v = decodeURIComponent(pair.substring(eqIdx + 1).trim());
-      v = v.replace(/^["']|["']$/g, "");
+      v = v.replace(/^[\"']|[\"']$/g, "");
       if (k) args[k] = v;
     });
   }
@@ -36,6 +41,9 @@ const CONFIG = {
   chunkSize: 80,
   maxUnique: 400,
 };
+
+// 純 CC 標記 regex：整行只有 [xxx] 的，不含音符歌詞
+const CC_ONLY_RE = /^\s*\[([^\]]+)\]\s*$/;
 
 // ─── Entry ────────────────────────────────────────────────────────────────────
 
@@ -89,10 +97,15 @@ const CONFIG = {
 // ─── VTT — regex insert (Neurogram style) ─────────────────────────────────────
 
 async function processVTT(body) {
-  // 合併跨行字幕成單行（同 Neurogram）
   body = body.replace(/\r/g, "");
-  body = body.replace(/(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n[^\n]+)\n([^\n]+)/g, "$1 $2");
-  body = body.replace(/(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n[^\n]+)\n([^\n]+)/g, "$1 $2");
+
+  // 合併跨行字幕：用 while loop 直到沒有多行為止
+  const multiLineRe = /(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n[^\n]+)\n([^\n]+)/g;
+  let prev;
+  do {
+    prev = body;
+    body = body.replace(multiLineRe, "$1 $2");
+  } while (body !== prev);
 
   // 抓所有 timeline（含字幕文字）
   const dialogueRe = /(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n)([^\n]+)/g;
@@ -105,7 +118,7 @@ async function processVTT(body) {
   if (dialogues.length === 0) return null;
   console.log("[Dualsub] VTT dialogues: " + dialogues.length);
 
-  // 去重翻譯
+  // 去重翻譯（CC 標記直接給空字串，不送 OpenAI）
   const translations = await translateDedup(dialogues.map(d => d.raw));
 
   // 插入譯文（不重建，直接 replace）
@@ -153,18 +166,27 @@ async function processTTML(body) {
 // ─── Translation ──────────────────────────────────────────────────────────────
 
 async function translateDedup(texts) {
-  // 建立去重 map
+  // normalize key：trim + 壓縮連續空白，避免空白差異造成重複翻譯
+  function normalizeKey(t) {
+    return t.trim().replace(/\s+/g, " ");
+  }
+
+  // CC 標記判斷：整行只有 [xxx]，直接跳過翻譯
+  function isCCOnly(t) {
+    return CC_ONLY_RE.test(t);
+  }
+
   const uniqueMap = {};
   const uniqueTexts = [];
   texts.forEach(t => {
-    const key = t.trim();
-    if (key && !uniqueMap.hasOwnProperty(key)) {
+    const key = normalizeKey(t);
+    if (key && !isCCOnly(key) && !uniqueMap.hasOwnProperty(key)) {
       uniqueMap[key] = uniqueTexts.length;
       uniqueTexts.push(key);
     }
   });
 
-  console.log("[Dualsub] Total: " + texts.length + " | Unique: " + uniqueTexts.length);
+  console.log("[Dualsub] Total: " + texts.length + " | Unique (non-CC): " + uniqueTexts.length);
 
   if (uniqueTexts.length === 0) return new Array(texts.length).fill("");
   if (uniqueTexts.length > CONFIG.maxUnique) {
@@ -182,10 +204,11 @@ async function translateDedup(texts) {
   const chunkResults = await Promise.all(chunks.map(c => callOpenAI(c)));
   const translatedUnique = [].concat(...chunkResults);
 
-  // 還原順序
+  // 還原順序；CC 標記直接回傳空字串（不顯示）
   return texts.map(t => {
-    const key = t.trim();
+    const key = normalizeKey(t);
     if (!key) return "";
+    if (isCCOnly(key)) return "";  // 純 CC 標記不顯示翻譯
     const idx = uniqueMap[key];
     return idx !== undefined ? (translatedUnique[idx] || "") : "";
   });
