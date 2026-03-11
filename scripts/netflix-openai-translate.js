@@ -254,18 +254,22 @@ async function translateBatch(texts) {
 
   if (uniqueTexts.length === 0) return new Array(texts.length).fill("");
 
-  // 超過 250 行拆成兩個平行 call，避免 timeout 與 token 上限
-  let translated;
-  const SPLIT = 250;
-  if (uniqueTexts.length > SPLIT) {
-    const half1 = uniqueTexts.slice(0, SPLIT);
-    const half2 = uniqueTexts.slice(SPLIT);
-    console.log("[Netflix-Dualsub] Splitting into 2 parallel calls: " + half1.length + " + " + half2.length);
-    const [res1, res2] = await Promise.all([callOpenAI(half1), callOpenAI(half2)]);
-    translated = res1.concat(res2);
-  } else {
-    translated = await callOpenAI(uniqueTexts);
+  // 硬上限：單次翻譯最多 400 個 unique 行，超過 pass-through（Netflix 分段載入，後續片段另行處理）
+  const MAX_UNIQUE = 400;
+  if (uniqueTexts.length > MAX_UNIQUE) {
+    console.log("[Netflix-Dualsub] Too many cues (" + uniqueTexts.length + "), pass-through to avoid timeout.");
+    return new Array(texts.length).fill("");
   }
+
+  // 每塊最多 200 行，全部平行送出
+  const CHUNK = 200;
+  const chunks = [];
+  for (let i = 0; i < uniqueTexts.length; i += CHUNK) {
+    chunks.push(uniqueTexts.slice(i, i + CHUNK));
+  }
+  console.log("[Netflix-Dualsub] Chunks: " + chunks.length + " x ~" + CHUNK + " lines (parallel)");
+  const results = await Promise.all(chunks.map((c) => callOpenAI(c)));
+  const translated = [].concat(...results);
 
   // 還原回原始順序
   return texts.map((t) => {
