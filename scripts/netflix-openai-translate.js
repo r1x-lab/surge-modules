@@ -31,19 +31,19 @@ const _args = parseArguments();
 
 const CONFIG = {
   apiKey:
-    _args["openai_api_key"] ||
+    _args["ApiKey"] ||
     $persistentStore.read("openai_api_key") ||
     "",
   model:
-    _args["openai_model"] ||
+    _args["Model"] ||
     $persistentStore.read("openai_model") ||
     "gpt-4o-mini",
   position:
-    _args["subtitle_position"] ||
+    _args["Position"] ||
     $persistentStore.read("subtitle_position") ||
     "original_top",
   targetLang:
-    _args["target_language"] ||
+    _args["Language"] ||
     $persistentStore.read("target_language") ||
     "繁體中文",
   cacheExpireMs: 24 * 60 * 60 * 1000, // 24 hours
