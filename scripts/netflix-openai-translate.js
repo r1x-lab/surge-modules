@@ -237,8 +237,18 @@ async function translateBatch(texts) {
 
   if (uniqueTexts.length === 0) return new Array(texts.length).fill("");
 
-  // 一次送完（gpt-4o-mini 上限夠用）
-  const translated = await callOpenAI(uniqueTexts);
+  // 超過 250 行拆成兩個平行 call，避免 timeout 與 token 上限
+  let translated;
+  const SPLIT = 250;
+  if (uniqueTexts.length > SPLIT) {
+    const half1 = uniqueTexts.slice(0, SPLIT);
+    const half2 = uniqueTexts.slice(SPLIT);
+    console.log("[Netflix-Dualsub] Splitting into 2 parallel calls: " + half1.length + " + " + half2.length);
+    const [res1, res2] = await Promise.all([callOpenAI(half1), callOpenAI(half2)]);
+    translated = res1.concat(res2);
+  } else {
+    translated = await callOpenAI(uniqueTexts);
+  }
 
   // 還原回原始順序
   return texts.map((t) => {
@@ -272,7 +282,7 @@ ${numbered}`;
           model: CONFIG.model,
           messages: [{ role: "user", content: prompt }],
           temperature: 0.2,
-          max_tokens: 4096,
+          max_tokens: 8192,
         }),
         timeout: 28,
       },
