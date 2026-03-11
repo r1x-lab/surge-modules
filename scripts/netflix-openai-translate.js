@@ -61,6 +61,8 @@ const CONFIG = {
 
 (async () => {
   try {
+    console.log("[Netflix-Dualsub] Script triggered. URL: " + $request.url.substring(0, 80));
+
     if (!CONFIG.apiKey) {
       console.log("[Netflix-Dualsub] No OpenAI API key set. Pass-through.");
       $done({});
@@ -69,8 +71,11 @@ const CONFIG = {
 
     const body = $response.body;
     const url = $request.url;
+    const status = $response.status;
+    console.log("[Netflix-Dualsub] Status: " + status + " | Body length: " + (body ? body.length : "null"));
 
     if (!body || body.length === 0) {
+      console.log("[Netflix-Dualsub] Empty body, pass-through.");
       $done({});
       return;
     }
