@@ -74,8 +74,18 @@ const CONFIG = {
     const status = $response.status;
     console.log("[Netflix-Dualsub] Status: " + status + " | Body length: " + (body ? body.length : "null"));
 
+    // 206 Partial Content with null body = video segment (non-text), skip
     if (!body || body.length === 0) {
       console.log("[Netflix-Dualsub] Empty body, pass-through.");
+      $done({});
+      return;
+    }
+
+    // 如果是二進位影片封包（body 不含可讀文字），直接跳過
+    const firstBytes = body.substring(0, 4);
+    const isBinary = firstBytes.split("").some(c => c.charCodeAt(0) < 9);
+    if (isBinary) {
+      console.log("[Netflix-Dualsub] Binary content, pass-through.");
       $done({});
       return;
     }
@@ -95,20 +105,27 @@ const CONFIG = {
 
     let result;
 
-    if (body.trimStart().startsWith("WEBVTT") || contentType.includes("vtt") || contentType.includes("text/vtt")) {
-      console.log("[Netflix-Dualsub] Format: VTT");
-      result = await processVTT(body);
-    } else if (
+    const isVTT =
+      body.trimStart().startsWith("WEBVTT") ||
+      contentType.includes("vtt") ||
+      contentType.includes("text/vtt") ||
+      /^\d+\s*\n\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->/.test(body.trimStart()) || // numbered cues without header
+      /^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->/.test(body.trimStart());            // bare timestamp cues
+
+    const isTTML =
       body.trimStart().startsWith("<?xml") ||
       body.trimStart().startsWith("<tt") ||
       contentType.includes("ttml") ||
       contentType.includes("xml") ||
-      contentType.includes("dfxp")
-    ) {
+      contentType.includes("dfxp");
+
+    if (isVTT) {
+      console.log("[Netflix-Dualsub] Format: VTT");
+      result = await processVTT(body);
+    } else if (isTTML) {
       console.log("[Netflix-Dualsub] Format: TTML/XML");
       result = await processTTML(body);
     } else {
-      // Unknown format — log and pass through
       console.log("[Netflix-Dualsub] Unknown format, pass-through. Length: " + body.length);
       $done({});
       return;
