@@ -217,7 +217,7 @@ async function translateDedup(texts) {
 function callOpenAI(textArray) {
   return new Promise(resolve => {
     const numbered = textArray.map((t, i) => `${i + 1}|${t}`).join("\n");
-    const prompt = `Translate each subtitle line to ${CONFIG.targetLang}. Output ONLY "N|translation" format, same count as input (${textArray.length} lines). Natural subtitle style, keep proper nouns in English.\n\n${numbered}`;
+    const prompt = `Translate each subtitle line to ${CONFIG.targetLang}. Rules:\n- Output ONLY "N|translation" lines, exactly ${textArray.length} lines, one per input line.\n- Translate each line INDEPENDENTLY. Do NOT merge, combine, or complete lines even if they appear to be mid-sentence.\n- If a line is a sentence fragment, translate only that fragment as-is.\n- Natural subtitle style. Keep proper nouns in English.\n\n${numbered}`;
 
     $httpClient.post({
       url: "https://api.openai.com/v1/chat/completions",
