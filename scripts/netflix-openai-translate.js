@@ -80,8 +80,8 @@ const CONFIG = {
       return;
     }
 
-    // Cache check
-    const cacheKey = "nf_sub_" + simpleHash(url);
+    // Cache check — 用內容 hash 而非 URL（URL 每次不同但字幕內容一樣）
+    const cacheKey = "nf_sub_" + simpleHash(body.substring(0, 512));
     const cached = readCache(cacheKey);
     if (cached) {
       console.log("[Netflix-Dualsub] Cache hit.");
@@ -221,41 +221,44 @@ async function processTTML(body) {
 
 // ─── OpenAI Translation ───────────────────────────────────────────────────────
 
+// 去重翻譯：相同原文只翻一次，大幅減少 token 數與 API 呼叫次數
 async function translateBatch(texts) {
-  const results = new Array(texts.length).fill("");
-  const batches = [];
-
-  for (let i = 0; i < texts.length; i += CONFIG.batchSize) {
-    batches.push(texts.slice(i, i + CONFIG.batchSize));
-  }
-
-  let offset = 0;
-  for (const batch of batches) {
-    const translated = await callOpenAI(batch);
-    for (let j = 0; j < translated.length; j++) {
-      results[offset + j] = translated[j];
+  // 建立唯一文字 map
+  const uniqueMap = {};
+  const uniqueTexts = [];
+  texts.forEach((t) => {
+    if (t && !uniqueMap.hasOwnProperty(t)) {
+      uniqueMap[t] = uniqueTexts.length;
+      uniqueTexts.push(t);
     }
-    offset += batch.length;
-  }
+  });
 
-  return results;
+  console.log("[Netflix-Dualsub] Total cues: " + texts.length + " | Unique: " + uniqueTexts.length);
+
+  if (uniqueTexts.length === 0) return new Array(texts.length).fill("");
+
+  // 一次送完（gpt-4o-mini 上限夠用）
+  const translated = await callOpenAI(uniqueTexts);
+
+  // 還原回原始順序
+  return texts.map((t) => {
+    if (!t) return "";
+    const idx = uniqueMap[t];
+    return translated[idx] || "";
+  });
 }
 
 function callOpenAI(textArray) {
   return new Promise((resolve) => {
-    const numbered = textArray
-      .map((t, i) => `${i + 1}. ${t}`)
-      .join("\n");
+    const numbered = textArray.map((t, i) => `${i + 1}|${t}`).join("\n");
 
-    const prompt = `你是專業字幕翻譯，請將以下每行字幕翻譯成${CONFIG.targetLang}。
-規則：
-- 保持編號格式（1. 2. 3. ...）
-- 每行只輸出譯文，不加原文
-- 口語化、自然，符合影視字幕風格
-- 專有名詞、人名保留英文
-- 數量：共 ${textArray.length} 行，輸出必須也是 ${textArray.length} 行
+    const prompt = `Translate each subtitle line to ${CONFIG.targetLang}. Rules:
+- Output ONLY the translation, one line per input, same numbering format "N|translation"
+- Natural, colloquial subtitle style
+- Keep proper nouns and names in English
+- Total input: ${textArray.length} lines → output exactly ${textArray.length} lines
 
-字幕：
+Input:
 ${numbered}`;
 
     $httpClient.post(
@@ -268,26 +271,32 @@ ${numbered}`;
         body: JSON.stringify({
           model: CONFIG.model,
           messages: [{ role: "user", content: prompt }],
-          temperature: 0.3,
-          max_tokens: 2048,
+          temperature: 0.2,
+          max_tokens: 4096,
         }),
-        timeout: 25,
+        timeout: 28,
       },
       (error, response, data) => {
-        if (error || response.status !== 200) {
-          console.log("[Netflix-Dualsub] OpenAI error: " + (error || response.status));
+        if (error || (response && response.status !== 200)) {
+          console.log("[Netflix-Dualsub] OpenAI error: " + (error || (response && response.status)));
           resolve(new Array(textArray.length).fill(""));
           return;
         }
         try {
           const json = JSON.parse(data);
           const content = json.choices[0].message.content.trim();
-          const lines = content.split("\n").map((l) =>
-            l.replace(/^\d+\.\s*/, "").trim()
-          );
-          // Pad or trim to match input count
-          while (lines.length < textArray.length) lines.push("");
-          resolve(lines.slice(0, textArray.length));
+          const resultMap = {};
+          content.split("\n").forEach((line) => {
+            const sep = line.indexOf("|");
+            if (sep > 0) {
+              const idx = parseInt(line.substring(0, sep), 10) - 1;
+              const val = line.substring(sep + 1).trim();
+              if (!isNaN(idx) && val) resultMap[idx] = val;
+            }
+          });
+          const out = textArray.map((_, i) => resultMap[i] || "");
+          console.log("[Netflix-Dualsub] Translated " + Object.keys(resultMap).length + "/" + textArray.length);
+          resolve(out);
         } catch (e) {
           console.log("[Netflix-Dualsub] Parse error: " + e.message);
           resolve(new Array(textArray.length).fill(""));
