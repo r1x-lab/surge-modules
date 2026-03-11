@@ -1,21 +1,15 @@
 /**
- * Netflix OpenAI Dualsub
+ * Netflix OpenAI Dualsub v2
  * Surge iOS Script (http-response)
  *
- * 功能：
- *   - 攔截 Netflix VTT/TTML 字幕
- *   - 用 OpenAI GPT 翻譯成繁體中文
- *   - 原文在上、譯文在下（或反過來，可設定）
- *   - $persistentStore 快取 24 小時，避免 20 分鐘失效
- *
- * BoxJs 設定 key（需安裝 BoxJs）：
- *   openai_api_key     — OpenAI API Key（必填）
- *   openai_model       — 模型，預設 gpt-4o-mini
- *   subtitle_position  — "original_top"（原文在上）| "translation_top"（譯文在上），預設 original_top
- *   target_language    — 目標語言，預設 ZH-HANT（繁體中文）
+ * 核心策略（參考 Neurogram-R）：
+ *   - 不重建 VTT，直接 regex 在原始 body 插入譯文
+ *   - 去重翻譯，平行分組送 OpenAI
+ *   - $persistentStore 快取（內容 hash）
  */
 
-// 優先從 Module Arguments ($argument) 讀取，fallback 到 $persistentStore（BoxJs）
+// ─── Config ───────────────────────────────────────────────────────────────────
+
 function parseArguments() {
   const args = {};
   if (typeof $argument !== "undefined" && $argument) {
@@ -24,373 +18,249 @@ function parseArguments() {
       if (eqIdx === -1) return;
       const k = decodeURIComponent(pair.substring(0, eqIdx).trim());
       let v = decodeURIComponent(pair.substring(eqIdx + 1).trim());
-      // 去掉 Surge 傳入時可能帶的前後引號
       v = v.replace(/^["']|["']$/g, "");
       if (k) args[k] = v;
     });
   }
-  console.log("[Netflix-Dualsub] Arguments parsed: " + JSON.stringify(Object.keys(args)));
-  console.log("[Netflix-Dualsub] ApiKey prefix: " + (args["ApiKey"] || "").substring(0, 8));
+  console.log("[Dualsub] Args: " + JSON.stringify(Object.keys(args)) + " | Key: " + (args["ApiKey"] || "").substring(0, 8));
   return args;
 }
 
 const _args = parseArguments();
-
 const CONFIG = {
-  apiKey:
-    _args["ApiKey"] ||
-    $persistentStore.read("openai_api_key") ||
-    "",
-  model:
-    _args["Model"] ||
-    $persistentStore.read("openai_model") ||
-    "gpt-4o-mini",
-  position:
-    _args["Position"] ||
-    $persistentStore.read("subtitle_position") ||
-    "original_top",
-  targetLang:
-    _args["Language"] ||
-    $persistentStore.read("target_language") ||
-    "繁體中文",
-  cacheExpireMs: 24 * 60 * 60 * 1000, // 24 hours
-  batchSize: 30, // lines per API call
+  apiKey:    _args["ApiKey"]    || $persistentStore.read("openai_api_key") || "",
+  model:     _args["Model"]     || $persistentStore.read("openai_model")   || "gpt-4o-mini",
+  position:  _args["Position"]  || $persistentStore.read("subtitle_position") || "original_top",
+  targetLang:_args["Language"]  || $persistentStore.read("target_language")   || "繁體中文",
+  cacheMs:   24 * 60 * 60 * 1000,
+  chunkSize: 80,
+  maxUnique: 400,
 };
 
-// ─── Entry Point ──────────────────────────────────────────────────────────────
+// ─── Entry ────────────────────────────────────────────────────────────────────
 
 (async () => {
   try {
-    console.log("[Netflix-Dualsub] Script triggered. URL: " + $request.url.substring(0, 80));
-
     if (!CONFIG.apiKey) {
-      console.log("[Netflix-Dualsub] No OpenAI API key set. Pass-through.");
+      console.log("[Dualsub] No API key, pass-through.");
       $done({});
       return;
     }
 
-    const body = $response.body;
-    const url = $request.url;
-    const status = $response.status;
-    console.log("[Netflix-Dualsub] Status: " + status + " | Body length: " + (body ? body.length : "null"));
+    let body = $response.body;
+    if (!body || body.length === 0) { $done({}); return; }
 
-    // 206 Partial Content with null body = video segment (non-text), skip
-    if (!body || body.length === 0) {
-      console.log("[Netflix-Dualsub] Empty body, pass-through.");
-      $done({});
-      return;
-    }
+    // Skip binary (video segments)
+    const firstChar = body.charCodeAt(0);
+    if (firstChar < 9) { $done({}); return; }
 
-    // 如果是二進位影片封包（body 不含可讀文字），直接跳過
-    const firstBytes = body.substring(0, 4);
-    const isBinary = firstBytes.split("").some(c => c.charCodeAt(0) < 9);
-    if (isBinary) {
-      console.log("[Netflix-Dualsub] Binary content, pass-through.");
-      $done({});
-      return;
-    }
+    const isVTT  = body.trimStart().startsWith("WEBVTT") ||
+                   /^\d+\s*\r?\n\d{2}:\d{2}/.test(body.trimStart()) ||
+                   /^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->/.test(body.trimStart());
+    const isTTML = body.trimStart().startsWith("<?xml") || body.trimStart().startsWith("<tt");
 
-    // Cache check — 用內容 hash 而非 URL（URL 每次不同但字幕內容一樣）
-    const cacheKey = "nf_sub_" + simpleHash(body.substring(0, 512));
-    const DEBUG_SKIP_CACHE = false; // 除錯時設 true 強制跑翻譯
-    const cached = !DEBUG_SKIP_CACHE && readCache(cacheKey);
+    if (!isVTT && !isTTML) { $done({}); return; }
+
+    // Cache by content hash
+    const cacheKey = "nfsub2_" + simpleHash(body.substring(0, 512));
+    const cached = readCache(cacheKey);
     if (cached) {
-      console.log("[Netflix-Dualsub] Cache hit. Preview: " + cached.substring(0, 150).replace(/\n/g, "\\n"));
+      console.log("[Dualsub] Cache hit.");
       $done({ body: cached });
       return;
     }
 
-    const contentType = ($response.headers["Content-Type"] || $response.headers["content-type"] || "").toLowerCase();
-    const bodyStart = body.trimStart().substring(0, 50);
-    console.log("[Netflix-Dualsub] Content-Type: " + contentType + " | Body start: " + bodyStart);
-
     let result;
-
-    const isVTT =
-      body.trimStart().startsWith("WEBVTT") ||
-      contentType.includes("vtt") ||
-      contentType.includes("text/vtt") ||
-      /^\d+\s*\n\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->/.test(body.trimStart()) || // numbered cues without header
-      /^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->/.test(body.trimStart());            // bare timestamp cues
-
-    const isTTML =
-      body.trimStart().startsWith("<?xml") ||
-      body.trimStart().startsWith("<tt") ||
-      contentType.includes("ttml") ||
-      contentType.includes("xml") ||
-      contentType.includes("dfxp");
-
-    if (isVTT) {
-      console.log("[Netflix-Dualsub] Format: VTT");
-      result = await processVTT(body);
-    } else if (isTTML) {
-      console.log("[Netflix-Dualsub] Format: TTML/XML");
-      result = await processTTML(body);
-    } else {
-      console.log("[Netflix-Dualsub] Unknown format, pass-through. Length: " + body.length);
-      $done({});
-      return;
-    }
+    if (isVTT)  result = await processVTT(body);
+    if (isTTML) result = await processTTML(body);
 
     if (result) {
       writeCache(cacheKey, result);
-      console.log("[Netflix-Dualsub] Output preview: " + result.substring(0, 200).replace(/\n/g, "\\n"));
       $done({ body: result });
     } else {
-      console.log("[Netflix-Dualsub] No result, pass-through.");
       $done({});
     }
   } catch (e) {
-    console.log("[Netflix-Dualsub] Error: " + e.message);
+    console.log("[Dualsub] Error: " + e.message);
     $done({});
   }
 })();
 
-// ─── VTT Processing ───────────────────────────────────────────────────────────
+// ─── VTT — regex insert (Neurogram style) ─────────────────────────────────────
 
 async function processVTT(body) {
-  const lines = body.split("\n");
-  const cues = []; // { index, start, end, text: [lines] }
-  let i = 0;
+  // 合併跨行字幕成單行（同 Neurogram）
+  body = body.replace(/\r/g, "");
+  body = body.replace(/(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n[^\n]+)\n([^\n]+)/g, "$1 $2");
+  body = body.replace(/(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n[^\n]+)\n([^\n]+)/g, "$1 $2");
 
-  // Parse
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    if (line.includes("-->")) {
-      const timeParts = line.split("-->").map((s) => s.trim());
-      const textLines = [];
-      i++;
-      while (i < lines.length && lines[i].trim() !== "") {
-        textLines.push(lines[i]);
-        i++;
-      }
-      if (textLines.length > 0) {
-        cues.push({
-          timing: line,
-          text: textLines,
-          rawText: stripVTTTags(textLines.join("\n")),
-        });
-      }
-    } else {
-      i++;
-    }
+  // 抓所有 timeline（含字幕文字）
+  const dialogueRe = /(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n)([^\n]+)/g;
+  const dialogues = [];
+  let m;
+  while ((m = dialogueRe.exec(body)) !== null) {
+    dialogues.push({ timing: m[1], text: m[2], raw: stripVTTTags(m[2]) });
   }
 
-  if (cues.length === 0) return null;
+  if (dialogues.length === 0) return null;
+  console.log("[Dualsub] VTT dialogues: " + dialogues.length);
 
-  // Translate in batches
-  const allTexts = cues.map((c) => c.rawText);
-  const translations = await translateBatch(allTexts);
+  // 去重翻譯
+  const translations = await translateDedup(dialogues.map(d => d.raw));
 
-  // Rebuild VTT
-  let out = "WEBVTT\n\n";
-  for (let j = 0; j < cues.length; j++) {
-    const cue = cues[j];
-    const trans = translations[j] || "";
-    out += cue.timing + "\n";
+  // 插入譯文（不重建，直接 replace）
+  for (let i = 0; i < dialogues.length; i++) {
+    const trans = translations[i];
+    if (!trans) continue;
+    const original = dialogues[i].timing + dialogues[i].text;
+    let replacement;
     if (CONFIG.position === "translation_top") {
-      if (trans) out += trans + "\n";
-      out += cue.text.join("\n") + "\n";
+      replacement = dialogues[i].timing + trans + "\n" + dialogues[i].text;
     } else {
-      out += cue.text.join("\n") + "\n";
-      if (trans) out += trans + "\n";
+      replacement = original + "\n" + trans;
     }
-    out += "\n";
+    body = body.replace(original, replacement);
   }
-  return out;
+
+  return body;
 }
 
-// ─── TTML Processing ──────────────────────────────────────────────────────────
+// ─── TTML ─────────────────────────────────────────────────────────────────────
 
 async function processTTML(body) {
-  // Extract all <p> text content
   const pRegex = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
   const matches = [];
   let m;
   while ((m = pRegex.exec(body)) !== null) {
-    matches.push({
-      full: m[0],
-      attrs: m[1],
-      inner: m[2],
-      rawText: stripXMLTags(m[2]).trim(),
-    });
+    matches.push({ full: m[0], attrs: m[1], inner: m[2], raw: stripXMLTags(m[2]).trim() });
   }
-
   if (matches.length === 0) return null;
 
-  const allTexts = matches.map((p) => p.rawText).filter(Boolean);
-  const translations = await translateBatch(allTexts);
+  const translations = await translateDedup(matches.map(p => p.raw));
 
   let result = body;
-  let tIdx = 0;
-  for (const match of matches) {
-    if (!match.rawText) continue;
-    const trans = translations[tIdx++] || "";
+  for (let i = 0; i < matches.length; i++) {
+    const trans = translations[i];
     if (!trans) continue;
-
-    let newInner;
-    if (CONFIG.position === "translation_top") {
-      newInner = trans + '<br />' + match.inner;
-    } else {
-      newInner = match.inner + '<br />' + trans;
-    }
-    result = result.replace(match.full, `<p${match.attrs}>${newInner}</p>`);
+    const newInner = CONFIG.position === "translation_top"
+      ? trans + "<br />" + matches[i].inner
+      : matches[i].inner + "<br />" + trans;
+    result = result.replace(matches[i].full, `<p${matches[i].attrs}>${newInner}</p>`);
   }
   return result;
 }
 
-// ─── OpenAI Translation ───────────────────────────────────────────────────────
+// ─── Translation ──────────────────────────────────────────────────────────────
 
-// 去重翻譯：相同原文只翻一次，大幅減少 token 數與 API 呼叫次數
-async function translateBatch(texts) {
-  // 建立唯一文字 map
+async function translateDedup(texts) {
+  // 建立去重 map
   const uniqueMap = {};
   const uniqueTexts = [];
-  texts.forEach((t) => {
-    if (t && !uniqueMap.hasOwnProperty(t)) {
-      uniqueMap[t] = uniqueTexts.length;
-      uniqueTexts.push(t);
+  texts.forEach(t => {
+    const key = t.trim();
+    if (key && !uniqueMap.hasOwnProperty(key)) {
+      uniqueMap[key] = uniqueTexts.length;
+      uniqueTexts.push(key);
     }
   });
 
-  console.log("[Netflix-Dualsub] Total cues: " + texts.length + " | Unique: " + uniqueTexts.length);
+  console.log("[Dualsub] Total: " + texts.length + " | Unique: " + uniqueTexts.length);
 
   if (uniqueTexts.length === 0) return new Array(texts.length).fill("");
-
-  // 硬上限：單次翻譯最多 400 個 unique 行，超過 pass-through（Netflix 分段載入，後續片段另行處理）
-  const MAX_UNIQUE = 400;
-  if (uniqueTexts.length > MAX_UNIQUE) {
-    console.log("[Netflix-Dualsub] Too many cues (" + uniqueTexts.length + "), pass-through to avoid timeout.");
+  if (uniqueTexts.length > CONFIG.maxUnique) {
+    console.log("[Dualsub] Too many cues, pass-through.");
     return new Array(texts.length).fill("");
   }
 
-  // 每塊最多 200 行，全部平行送出
-  const CHUNK = 200;
+  // 分 chunk 平行翻譯
   const chunks = [];
-  for (let i = 0; i < uniqueTexts.length; i += CHUNK) {
-    chunks.push(uniqueTexts.slice(i, i + CHUNK));
+  for (let i = 0; i < uniqueTexts.length; i += CONFIG.chunkSize) {
+    chunks.push(uniqueTexts.slice(i, i + CONFIG.chunkSize));
   }
-  console.log("[Netflix-Dualsub] Chunks: " + chunks.length + " x ~" + CHUNK + " lines (parallel)");
-  const results = await Promise.all(chunks.map((c) => callOpenAI(c)));
-  const translated = [].concat(...results);
+  console.log("[Dualsub] " + chunks.length + " chunks x ~" + CONFIG.chunkSize);
 
-  // 還原回原始順序
-  return texts.map((t) => {
-    if (!t) return "";
-    const idx = uniqueMap[t];
-    return translated[idx] || "";
+  const chunkResults = await Promise.all(chunks.map(c => callOpenAI(c)));
+  const translatedUnique = [].concat(...chunkResults);
+
+  // 還原順序
+  return texts.map(t => {
+    const key = t.trim();
+    if (!key) return "";
+    const idx = uniqueMap[key];
+    return idx !== undefined ? (translatedUnique[idx] || "") : "";
   });
 }
 
 function callOpenAI(textArray) {
-  return new Promise((resolve) => {
+  return new Promise(resolve => {
     const numbered = textArray.map((t, i) => `${i + 1}|${t}`).join("\n");
+    const prompt = `Translate each subtitle line to ${CONFIG.targetLang}. Output ONLY "N|translation" format, same count as input (${textArray.length} lines). Natural subtitle style, keep proper nouns in English.\n\n${numbered}`;
 
-    const prompt = `Translate each subtitle line to ${CONFIG.targetLang}. Rules:
-- Output ONLY the translation, one line per input, same numbering format "N|translation"
-- Natural, colloquial subtitle style
-- Keep proper nouns and names in English
-- Total input: ${textArray.length} lines → output exactly ${textArray.length} lines
-
-Input:
-${numbered}`;
-
-    $httpClient.post(
-      {
-        url: "https://api.openai.com/v1/chat/completions",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + CONFIG.apiKey,
-        },
-        body: JSON.stringify({
-          model: CONFIG.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.2,
-          max_tokens: 8192,
-        }),
-        timeout: 28,
-      },
-      (error, response, data) => {
-        if (error || (response && response.status !== 200)) {
-          console.log("[Netflix-Dualsub] OpenAI error: " + (error || (response && response.status)));
-          resolve(new Array(textArray.length).fill(""));
-          return;
-        }
-        try {
-          const json = JSON.parse(data);
-          const content = json.choices[0].message.content.trim();
-          const resultMap = {};
-          content.split("\n").forEach((line) => {
-            const sep = line.indexOf("|");
-            if (sep > 0) {
-              const idx = parseInt(line.substring(0, sep), 10) - 1;
-              const val = line.substring(sep + 1).trim();
-              if (!isNaN(idx) && val) resultMap[idx] = val;
-            }
-          });
-          const out = textArray.map((_, i) => resultMap[i] || "");
-          console.log("[Netflix-Dualsub] Translated " + Object.keys(resultMap).length + "/" + textArray.length);
-          resolve(out);
-        } catch (e) {
-          console.log("[Netflix-Dualsub] Parse error: " + e.message);
-          resolve(new Array(textArray.length).fill(""));
-        }
+    $httpClient.post({
+      url: "https://api.openai.com/v1/chat/completions",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + CONFIG.apiKey },
+      body: JSON.stringify({
+        model: CONFIG.model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        max_tokens: 4096,
+      }),
+      timeout: 28,
+    }, (error, response, data) => {
+      if (error || !response || response.status !== 200) {
+        console.log("[Dualsub] OpenAI err: " + (error || (response && response.status)));
+        resolve(new Array(textArray.length).fill(""));
+        return;
       }
-    );
+      try {
+        const content = JSON.parse(data).choices[0].message.content.trim();
+        const map = {};
+        content.split("\n").forEach(line => {
+          const sep = line.indexOf("|");
+          if (sep > 0) {
+            const idx = parseInt(line.substring(0, sep), 10) - 1;
+            const val = line.substring(sep + 1).trim();
+            if (!isNaN(idx) && val) map[idx] = val;
+          }
+        });
+        const out = textArray.map((_, i) => map[i] || "");
+        console.log("[Dualsub] Translated " + Object.keys(map).length + "/" + textArray.length);
+        resolve(out);
+      } catch (e) {
+        console.log("[Dualsub] Parse err: " + e.message);
+        resolve(new Array(textArray.length).fill(""));
+      }
+    });
   });
 }
 
-// ─── Cache Helpers ────────────────────────────────────────────────────────────
+// ─── Cache ────────────────────────────────────────────────────────────────────
 
 function readCache(key) {
   try {
     const raw = $persistentStore.read(key);
     if (!raw) return null;
     const obj = JSON.parse(raw);
-    if (Date.now() - obj.ts > CONFIG.cacheExpireMs) {
-      $persistentStore.write(null, key);
-      return null;
-    }
+    if (Date.now() - obj.ts > CONFIG.cacheMs) { $persistentStore.write(null, key); return null; }
     return obj.data;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 function writeCache(key, data) {
-  try {
-    $persistentStore.write(JSON.stringify({ ts: Date.now(), data }), key);
-  } catch (e) {
-    console.log("[Netflix-Dualsub] Cache write error: " + e.message);
-  }
+  try { $persistentStore.write(JSON.stringify({ ts: Date.now(), data }), key); }
+  catch (e) { console.log("[Dualsub] Cache err: " + e.message); }
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
 
 function stripVTTTags(text) {
-  return text
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .trim();
+  return text.replace(/<[^>]+>/g, "").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").trim();
 }
-
 function stripXMLTags(text) {
-  return text
-    .replace(/<br\s*\/?>/gi, " ")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#160;/g, " ")
-    .trim();
+  return text.replace(/<br\s*\/?>/gi," ").replace(/<[^>]+>/g,"").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&#160;/g," ").trim();
 }
-
 function simpleHash(str) {
   let h = 0;
-  for (let i = 0; i < Math.min(str.length, 128); i++) {
-    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
-  }
+  for (let i = 0; i < Math.min(str.length, 128); i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
   return Math.abs(h).toString(16);
 }
