@@ -77,20 +77,27 @@ const CONFIG = {
       return;
     }
 
-    let result;
-    const contentType = ($response.headers["Content-Type"] || "").toLowerCase();
+    const contentType = ($response.headers["Content-Type"] || $response.headers["content-type"] || "").toLowerCase();
+    const bodyStart = body.trimStart().substring(0, 50);
+    console.log("[Netflix-Dualsub] Content-Type: " + contentType + " | Body start: " + bodyStart);
 
-    if (body.trimStart().startsWith("WEBVTT") || url.includes(".vtt")) {
+    let result;
+
+    if (body.trimStart().startsWith("WEBVTT") || contentType.includes("vtt") || contentType.includes("text/vtt")) {
+      console.log("[Netflix-Dualsub] Format: VTT");
       result = await processVTT(body);
     } else if (
       body.trimStart().startsWith("<?xml") ||
-      url.includes(".ttml") ||
-      url.includes(".xml") ||
-      url.includes(".dfxp")
+      body.trimStart().startsWith("<tt") ||
+      contentType.includes("ttml") ||
+      contentType.includes("xml") ||
+      contentType.includes("dfxp")
     ) {
+      console.log("[Netflix-Dualsub] Format: TTML/XML");
       result = await processTTML(body);
     } else {
-      // Unknown format — pass through
+      // Unknown format — log and pass through
+      console.log("[Netflix-Dualsub] Unknown format, pass-through. Length: " + body.length);
       $done({});
       return;
     }
