@@ -217,7 +217,7 @@ async function translateDedup(texts) {
 function callOpenAI(textArray) {
   return new Promise(resolve => {
     const numbered = textArray.map((t, i) => `${i + 1}|${t}`).join("\n");
-    const prompt = `Translate each subtitle line to ${CONFIG.targetLang}. Rules:\n- Output ONLY "N|translation" lines, exactly ${textArray.length} lines, one per input line.\n- Translate each line INDEPENDENTLY. Do NOT merge, combine, or complete lines even if they appear to be mid-sentence.\n- If a line is a sentence fragment, translate only that fragment as-is.\n- Natural subtitle style. Keep proper nouns in English.\n\n${numbered}`;
+    const prompt = `You are a subtitle translator. Each numbered line is a TIMED subtitle cue with a fixed display slot. Sentences may be intentionally split across multiple cues for timing reasons.\n\nRules (strictly follow):\n1. Output EXACTLY ${textArray.length} lines in "N|translation" format — one output line per input line, no exceptions.\n2. Translate ONLY the words in each line. Do NOT complete, extend, or borrow words from adjacent lines.\n3. If a line is a sentence fragment (starts or ends mid-sentence), translate that fragment alone — even if the result is grammatically incomplete in ${CONFIG.targetLang}.\n4. Never merge two input lines into one output line.\n5. Natural subtitle style. Keep proper nouns in English.\n\nTarget language: ${CONFIG.targetLang}\n\n${numbered}`;
 
     $httpClient.post({
       url: "https://api.openai.com/v1/chat/completions",
@@ -246,8 +246,17 @@ function callOpenAI(textArray) {
             if (!isNaN(idx) && val) map[idx] = val;
           }
         });
+        const hitCount = Object.keys(map).length;
+        console.log("[Dualsub] Translated " + hitCount + "/" + textArray.length);
+
+        // 行數驗證：若 GPT 少回 > 10%，視為發生跨行合併，結果不可信
+        if (hitCount < textArray.length * 0.9) {
+          console.log("[Dualsub] Line count mismatch (" + hitCount + " vs " + textArray.length + "), discarding batch.");
+          resolve(new Array(textArray.length).fill(""));
+          return;
+        }
+
         const out = textArray.map((_, i) => map[i] || "");
-        console.log("[Dualsub] Translated " + Object.keys(map).length + "/" + textArray.length);
         resolve(out);
       } catch (e) {
         console.log("[Dualsub] Parse err: " + e.message);
