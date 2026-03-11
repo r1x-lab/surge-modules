@@ -1,0 +1,19 @@
+#!name=Netflix OpenAI Dualsub
+#!desc=Netflix 雙語字幕 — 使用 OpenAI GPT 翻譯，支援繁體中文，快取機制防止失效
+#!system=ios
+#!category=流媒體
+#!version=1.1.0
+#!author=miniR
+#!homepage=https://github.com/
+
+[Module Arguments]
+openai_api_key = type=input, display=OpenAI API Key, desc=填入你的 OpenAI API Key（sk-...）, default=
+openai_model = type=select, display=翻譯模型, desc=gpt-4o-mini 便宜快速；gpt-4o 品質更好, options=gpt-4o-mini|gpt-4o|gpt-4.1-mini|gpt-4.1, default=gpt-4o-mini
+subtitle_position = type=select, display=字幕位置, desc=原文與譯文的上下順序, options=original_top|translation_top, default=original_top
+target_language = type=input, display=目標語言, desc=翻譯目標語言（繁體中文／简体中文／日本語 等）, default=繁體中文
+
+[Script]
+Netflix Subtitle Translate = type=http-response,pattern=^https://.*\.oca\.nflxvideo\.net/.*\.(vtt|ttml|xml|dfxp)(\?|$),requires-body=1,max-size=0,timeout=30,script-path=https://raw.githubusercontent.com/a88250215us-spec/surge-modules/main/scripts/netflix-openai-translate.js,script-update-interval=86400,argument=openai_api_key={openai_api_key}&openai_model={openai_model}&subtitle_position={subtitle_position}&target_language={target_language}
+
+[MITM]
+hostname = *.oca.nflxvideo.net
