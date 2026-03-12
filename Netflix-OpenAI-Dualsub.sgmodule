@@ -1,14 +1,14 @@
 #!name = Netflix OpenAI Dualsub
-#!desc = Netflix 雙語字幕 — 使用 OpenAI GPT 翻譯，支援繁體中文，快取機制防止失效
+#!desc = Netflix 雙語字幕 — 支援 OpenAI / Grok 翻譯，繁體中文，快取機制防止重複計費
 #!system = ios
 #!category = 流媒體
-#!version = 1.3.0
+#!version = 1.4.0
 #!author = miniR
-#!arguments = ApiKey:"",Model:"gpt-4o-mini",Position:"original_top",Language:"繁體中文"
-#!arguments-desc = ApiKey: OpenAI API Key\n填入你的 OpenAI API Key（sk-...），必填。\n\nModel: 翻譯模型\n    ├ gpt-4o-mini: 便宜快速（推薦）\n    ├ gpt-4o: 品質更好\n    ├ gpt-4.1-mini: 最新輕量\n    └ gpt-4.1: 最新旗艦\n\nPosition: 字幕位置\n    ├ original_top: 原文在上，譯文在下\n    └ translation_top: 譯文在上，原文在下\n\nLanguage: 目標語言\n填入翻譯目標語言，例如：繁體中文、简体中文、日本語。
+#!arguments = ApiKey:"",Provider:"openai",Model:"gpt-4o-mini",Position:"original_top",Language:"繁體中文"
+#!arguments-desc = ApiKey: API Key\n填入對應 Provider 的 API Key。\n  OpenAI: sk-...\n  Grok:   xai-...\n\nProvider: 翻譯服務\n    ├ openai: OpenAI（付費）\n    └ grok: xAI Grok（每月 $25 免費額度）\n\nModel: 翻譯模型\n  OpenAI:\n    ├ gpt-4o-mini: 便宜快速（推薦）\n    ├ gpt-4o: 品質更好\n    ├ gpt-4.1-mini: 最新輕量\n    └ gpt-4.1: 最新旗艦\n  Grok:\n    ├ grok-3-mini-fast: 快速省 token（推薦）\n    └ grok-3-mini: 品質稍好\n\nPosition: 字幕位置\n    ├ original_top: 原文在上，譯文在下\n    └ translation_top: 譯文在上，原文在下\n\nLanguage: 目標語言\n填入翻譯目標語言，例如：繁體中文、简体中文、日本語。
 
 [Script]
-Netflix Subtitle Translate = type=http-response, pattern=^https?://([^/]+\.)?oca\.nflxvideo\.net/\?o=\d+&v=\d+&e=\d+&t=, requires-body=1, max-size=0, timeout=30, script-path=https://raw.githubusercontent.com/a88250215us-spec/surge-modules/main/scripts/netflix-openai-translate.js, script-update-interval=86400, argument=ApiKey="{{{ApiKey}}}"&Model="{{{Model}}}"&Position="{{{Position}}}"&Language="{{{Language}}}"
+Netflix Subtitle Translate = type=http-response, pattern=^https?://([^/]+\.)?oca\.nflxvideo\.net/\?o=\d+&v=\d+&e=\d+&t=, requires-body=1, max-size=0, timeout=30, script-path=https://raw.githubusercontent.com/r1x-lab/surge-modules/main/scripts/netflix-openai-translate.js, script-update-interval=86400, argument=ApiKey="{{{ApiKey}}}"&Provider="{{{Provider}}}"&Model="{{{Model}}}"&Position="{{{Position}}}"&Language="{{{Language}}}"
 
 [MITM]
 hostname = %APPEND% *.oca.nflxvideo.net

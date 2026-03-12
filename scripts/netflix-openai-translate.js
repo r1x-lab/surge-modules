@@ -1,11 +1,15 @@
 /**
- * Netflix OpenAI Dualsub v2.1
+ * Netflix OpenAI Dualsub v2.2
  * Surge iOS Script (http-response)
  *
  * 核心策略（參考 Neurogram-R）：
  *   - 不重建 VTT，直接 regex 在原始 body 插入譯文
- *   - 去重翻譯，平行分組送 OpenAI
+ *   - 去重翻譯，平行分組送 OpenAI / Grok
  *   - $persistentStore 快取（內容 hash）
+ *
+ * v2.2 變更：
+ *   - 新增 Provider 參數，支援 openai / grok
+ *   - Grok 用 https://api.x.ai/v1/chat/completions，其餘流程完全相同
  *
  * v2.1 變更：
  *   - 拆行合併改 while loop，正確處理 3+ 行字幕
@@ -27,14 +31,25 @@ function parseArguments() {
       if (k) args[k] = v;
     });
   }
-  console.log("[Dualsub] Args: " + JSON.stringify(Object.keys(args)) + " | Key: " + (args["ApiKey"] || "").substring(0, 8));
+  console.log("[Dualsub] Args: " + JSON.stringify(Object.keys(args)) + " | Provider: " + (args["Provider"] || "openai") + " | Key: " + (args["ApiKey"] || "").substring(0, 8));
   return args;
 }
 
 const _args = parseArguments();
+
+// Provider → API endpoint mapping
+const PROVIDER_ENDPOINTS = {
+  openai: "https://api.openai.com/v1/chat/completions",
+  grok:   "https://api.x.ai/v1/chat/completions",
+};
+
+const _provider = (_args["Provider"] || $persistentStore.read("subtitle_provider") || "openai").toLowerCase();
+
 const CONFIG = {
   apiKey:    _args["ApiKey"]    || $persistentStore.read("openai_api_key") || "",
-  model:     _args["Model"]     || $persistentStore.read("openai_model")   || "gpt-4o-mini",
+  provider:  _provider,
+  apiUrl:    PROVIDER_ENDPOINTS[_provider] || PROVIDER_ENDPOINTS["openai"],
+  model:     _args["Model"]     || $persistentStore.read("openai_model")   || (_provider === "grok" ? "grok-3-mini-fast" : "gpt-4o-mini"),
   position:  _args["Position"]  || $persistentStore.read("subtitle_position") || "original_top",
   targetLang:_args["Language"]  || $persistentStore.read("target_language")   || "繁體中文",
   cacheMs:   24 * 60 * 60 * 1000,
@@ -220,7 +235,7 @@ function callOpenAI(textArray) {
     const prompt = `You are a subtitle translator. Each numbered line is a TIMED subtitle cue with a fixed display slot. Sentences may be intentionally split across multiple cues for timing reasons.\n\nRules (strictly follow):\n1. Output EXACTLY ${textArray.length} lines in "N|translation" format — one output line per input line, no exceptions.\n2. Translate ONLY the words in each line. Do NOT complete, extend, or borrow words from adjacent lines.\n3. If a line is a sentence fragment (starts or ends mid-sentence), translate that fragment alone — even if the result is grammatically incomplete in ${CONFIG.targetLang}.\n4. Never merge two input lines into one output line.\n5. Natural subtitle style. Keep proper nouns in English.\n\nTarget language: ${CONFIG.targetLang}\n\n${numbered}`;
 
     $httpClient.post({
-      url: "https://api.openai.com/v1/chat/completions",
+      url: CONFIG.apiUrl,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + CONFIG.apiKey },
       body: JSON.stringify({
         model: CONFIG.model,
