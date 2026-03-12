@@ -1,27 +1,38 @@
 /**
- * Netflix OpenAI Dualsub
+ * Netflix OpenAI Dualsub v2.3
  * Surge iOS Script (http-response)
  *
  * 功能：
  *   - 攔截 Netflix VTT/TTML 字幕
- *   - 用 OpenAI GPT 翻譯成繁體中文
+ *   - 用 OpenAI / Grok 翻譯成繁體中文（或指定語言）
  *   - 原文在上、譯文在下（或反過來，可設定）
- *   - $persistentStore 快取 24 小時，避免 20 分鐘失效
+ *   - $persistentStore 快取 24 小時，避免重複計費
  *
- * BoxJs 設定 key（需安裝 BoxJs）：
- *   openai_api_key     — OpenAI API Key（必填）
- *   openai_model       — 模型，預設 gpt-4o-mini
- *   subtitle_position  — "original_top"（原文在上）| "translation_top"（譯文在上），預設 original_top
- *   target_language    — 目標語言，預設 ZH-HANT（繁體中文）
+ * Module Arguments（sgmodule 設定）：
+ *   ApiKey    — API Key（OpenAI: sk-... / Grok: xai-...）
+ *   Provider  — openai（預設）| grok
+ *   Model     — 翻譯模型，預設依 Provider 自動選
+ *   Position  — original_top（原文在上）| translation_top（譯文在上）
+ *   Language  — 目標語言，預設 繁體中文
  */
+
+const PROVIDER_ENDPOINTS = {
+  openai: "https://api.openai.com/v1/chat/completions",
+  grok:   "https://api.x.ai/v1/chat/completions",
+};
 
 // 優先從 Module Arguments ($argument) 讀取，fallback 到 $persistentStore（BoxJs）
 function parseArguments() {
   const args = {};
   if (typeof $argument !== "undefined" && $argument) {
     $argument.split("&").forEach((pair) => {
-      const [k, v] = pair.split("=");
-      if (k && v !== undefined) args[decodeURIComponent(k)] = decodeURIComponent(v);
+      const eqIdx = pair.indexOf("=");
+      if (eqIdx === -1) return;
+      const k = decodeURIComponent(pair.substring(0, eqIdx).trim());
+      let v = decodeURIComponent(pair.substring(eqIdx + 1).trim());
+      // Strip surrounding quotes that Surge sometimes adds
+      v = v.replace(/^["']|["']$/g, "");
+      if (k) args[k] = v;
     });
   }
   return args;
@@ -29,20 +40,28 @@ function parseArguments() {
 
 const _args = parseArguments();
 
+const _provider = (_args["Provider"] || $persistentStore.read("subtitle_provider") || "openai").toLowerCase();
+
 const CONFIG = {
   apiKey:
+    _args["ApiKey"] ||
     _args["openai_api_key"] ||
     $persistentStore.read("openai_api_key") ||
     "",
+  provider: _provider,
+  apiUrl: PROVIDER_ENDPOINTS[_provider] || PROVIDER_ENDPOINTS["openai"],
   model:
+    _args["Model"] ||
     _args["openai_model"] ||
     $persistentStore.read("openai_model") ||
-    "gpt-4o-mini",
+    (_provider === "grok" ? "grok-3-mini-fast" : "gpt-4o-mini"),
   position:
+    _args["Position"] ||
     _args["subtitle_position"] ||
     $persistentStore.read("subtitle_position") ||
     "original_top",
   targetLang:
+    _args["Language"] ||
     _args["target_language"] ||
     $persistentStore.read("target_language") ||
     "繁體中文",
@@ -55,7 +74,7 @@ const CONFIG = {
 (async () => {
   try {
     if (!CONFIG.apiKey) {
-      console.log("[Netflix-Dualsub] No OpenAI API key set. Pass-through.");
+      console.log("[Netflix-Dualsub] No API key set (Provider: " + CONFIG.provider + "). Pass-through.");
       $done({});
       return;
     }
@@ -337,7 +356,7 @@ ${numbered}`;
 
     $httpClient.post(
       {
-        url: "https://api.openai.com/v1/chat/completions",
+        url: CONFIG.apiUrl,
         headers: {
           "Content-Type": "application/json",
           Authorization: "Bearer " + CONFIG.apiKey,
