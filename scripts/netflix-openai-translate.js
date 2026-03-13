@@ -1,10 +1,12 @@
 /**
- * Netflix OpenAI Dualsub v2.7
+ * Netflix OpenAI Dualsub v2.8
  * Surge iOS Script (http-response)
  *
- * v2.7 變更：
+ * v2.8 變更：
  *   - callOpenAI 失敗或長度不符時，遞迴拆半重試（最小 1 條）
  *   - 完全消除「一段有翻譯一段沒字幕」問題
+ *   - 修正 translateWithRetry 無限遞迴 bug（1-text chunk 失敗時會死循環）
+ *   - 遞迴重試時正確縮小 chunk size（原本固定用 40，改為傳入 half）
  */
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -211,11 +213,11 @@ async function translateDedup(texts) {
 async function translateWithRetry(texts, chunkSize) {
   const result = new Array(texts.length).fill("");
 
-  async function processRange(arr, offset) {
+  async function processRange(arr, offset, size) {
     if (arr.length === 0) return;
     const chunks = [];
-    for (let i = 0; i < arr.length; i += chunkSize) {
-      chunks.push({ texts: arr.slice(i, i + chunkSize), offset: offset + i });
+    for (let i = 0; i < arr.length; i += size) {
+      chunks.push({ texts: arr.slice(i, i + size), offset: offset + i });
     }
     await Promise.all(chunks.map(async c => {
       const translated = await callOpenAISingle(c.texts);
@@ -224,18 +226,18 @@ async function translateWithRetry(texts, chunkSize) {
         for (let j = 0; j < translated.length; j++) {
           result[c.offset + j] = translated[j];
         }
-      } else if (chunkSize > 1) {
-        // 失敗：拆半重試
+      } else if (c.texts.length > 1) {
+        // 失敗：拆半重試，用更小的 chunk size
         const half = Math.ceil(c.texts.length / 2);
-        console.log("[Dualsub] Retry chunk size " + chunkSize + " → " + half);
-        await processRange(c.texts.slice(0, half), c.offset);
-        await processRange(c.texts.slice(half), c.offset + half);
+        console.log("[Dualsub] Retry " + c.texts.length + " → " + half);
+        await processRange(c.texts.slice(0, half), c.offset, half);
+        await processRange(c.texts.slice(half), c.offset + half, half);
       }
-      // chunkSize=1 還失敗就放空（罕見）
+      // c.texts.length === 1 還失敗就放空（罕見）
     }));
   }
 
-  await processRange(texts, 0);
+  await processRange(texts, 0, chunkSize);
   return result;
 }
 
