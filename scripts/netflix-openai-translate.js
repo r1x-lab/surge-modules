@@ -41,7 +41,7 @@ const CONFIG = {
   position:  _args["Position"]  || $persistentStore.read("subtitle_position") || "original_top",
   targetLang:_args["Language"]  || $persistentStore.read("target_language")   || "繁體中文",
   cacheMs:   24 * 60 * 60 * 1000,
-  chunkSize: 80,
+  chunkSize: 40,
   maxUnique: 400,
 };
 
@@ -230,8 +230,8 @@ async function translateDedup(texts) {
 
 function callOpenAI(textArray) {
   return new Promise(resolve => {
-    const numbered = textArray.map((t, i) => `${i + 1}|${t}`).join("\n");
-    const prompt = `You are a subtitle translator. Each numbered line is a TIMED subtitle cue with a fixed display slot. Sentences may be intentionally split across multiple cues for timing reasons.\n\nRules (strictly follow):\n1. Output EXACTLY ${textArray.length} lines in "N|translation" format — one output line per input line, no exceptions.\n2. Translate ONLY the words in each line. Do NOT complete, extend, or borrow words from adjacent lines.\n3. If a line is a sentence fragment (starts or ends mid-sentence), translate that fragment alone — even if the result is grammatically incomplete in ${CONFIG.targetLang}.\n4. Never merge two input lines into one output line.\n5. Natural subtitle style. Keep proper nouns in English.\n\nTarget language: ${CONFIG.targetLang}\n\n${numbered}`;
+    const lines = textArray.map((t, i) => `${i + 1}. ${t}`).join("\n");
+    const prompt = `You are a subtitle translator. Each numbered line is a timed subtitle cue.\n\nReturn ONLY a JSON object: {"t": ["trans1", "trans2", ...]} with EXACTLY ${textArray.length} elements.\nArray index 0 = line 1. Never merge lines. Translate fragments as-is.\nTarget language: ${CONFIG.targetLang}\n\n${lines}`;
 
     $httpClient.post({
       url: "https://api.openai.com/v1/chat/completions",
@@ -239,8 +239,9 @@ function callOpenAI(textArray) {
       body: JSON.stringify({
         model: CONFIG.model,
         messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
+        temperature: 0,
         max_tokens: 4096,
+        response_format: { type: "json_object" },
       }),
       timeout: 28,
     }, (error, response, data) => {
@@ -251,27 +252,18 @@ function callOpenAI(textArray) {
       }
       try {
         const content = JSON.parse(data).choices[0].message.content.trim();
-        const map = {};
-        content.split("\n").forEach(line => {
-          const sep = line.indexOf("|");
-          if (sep > 0) {
-            const idx = parseInt(line.substring(0, sep), 10) - 1;
-            const val = line.substring(sep + 1).trim();
-            if (!isNaN(idx) && val) map[idx] = val;
-          }
-        });
-        const hitCount = Object.keys(map).length;
-        console.log("[Dualsub] Translated " + hitCount + "/" + textArray.length);
+        const parsed = JSON.parse(content);
+        const arr = parsed.t || parsed.translations || [];
+        console.log("[Dualsub] Translated " + arr.length + "/" + textArray.length);
 
-        // 行數驗證：若 GPT 少回 > 10%，視為發生跨行合併，結果不可信
-        if (hitCount < textArray.length * 0.9) {
-          console.log("[Dualsub] Line count mismatch (" + hitCount + " vs " + textArray.length + "), discarding batch.");
+        // 嚴格長度驗證：長度不對 = GPT 有 merge，整批丟棄避免 shift
+        if (!Array.isArray(arr) || arr.length !== textArray.length) {
+          console.log("[Dualsub] Array length mismatch, discarding batch.");
           resolve(new Array(textArray.length).fill(""));
           return;
         }
 
-        const out = textArray.map((_, i) => map[i] || "");
-        resolve(out);
+        resolve(arr.map(v => (typeof v === "string" ? v.trim() : "")));
       } catch (e) {
         console.log("[Dualsub] Parse err: " + e.message);
         resolve(new Array(textArray.length).fill(""));
