@@ -1,19 +1,10 @@
 /**
- * Netflix OpenAI Dualsub v2.6
+ * Netflix OpenAI Dualsub v2.7
  * Surge iOS Script (http-response)
  *
- * 核心策略（參考 Neurogram-R）：
- *   - 不重建 VTT，直接 regex 在原始 body 插入譯文
- *   - 去重翻譯，平行分組送 OpenAI
- *   - $persistentStore 快取（內容 hash）
- *
- * v2.1 變更：
- *   - 拆行合併改 while loop，正確處理 3+ 行字幕
- *   - 純 CC 標記（[MUSIC] / [APPLAUSE] 等）不送翻譯，直接保留原文
- *   - 去重 key normalize（trim + 壓縮空白），避免空白差異造成重複翻譯
- *
- * v2.6 變更：
- *   - VTT 插入改用位置索引（從後往前），完全避免 string.replace 搜尋位置偏移問題
+ * v2.7 變更：
+ *   - callOpenAI 失敗或長度不符時，遞迴拆半重試（最小 1 條）
+ *   - 完全消除「一段有翻譯一段沒字幕」問題
  */
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -135,10 +126,8 @@ async function processVTT(body) {
     const trans = translations[i];
     if (!trans) continue;
     if (CONFIG.position === "translation_top") {
-      // 在 timing 行之後、原文之前插入譯文
       inserts.push({ pos: dialogues[i].matchStart + dialogues[i].timing.length, text: trans + "\n" });
     } else {
-      // 在原文之後插入譯文
       inserts.push({ pos: dialogues[i].matchEnd, text: "\n" + trans });
     }
   }
@@ -180,12 +169,9 @@ async function processTTML(body) {
 // ─── Translation ──────────────────────────────────────────────────────────────
 
 async function translateDedup(texts) {
-  // normalize key：trim + 壓縮連續空白，避免空白差異造成重複翻譯
   function normalizeKey(t) {
     return t.trim().replace(/\s+/g, " ");
   }
-
-  // CC 標記判斷：整行只有 [xxx]，直接跳過翻譯
   function isCCOnly(t) {
     return CC_ONLY_RE.test(t);
   }
@@ -208,27 +194,53 @@ async function translateDedup(texts) {
     return new Array(texts.length).fill("");
   }
 
-  // 分 chunk 平行翻譯
-  const chunks = [];
-  for (let i = 0; i < uniqueTexts.length; i += CONFIG.chunkSize) {
-    chunks.push(uniqueTexts.slice(i, i + CONFIG.chunkSize));
-  }
-  console.log("[Dualsub] " + chunks.length + " chunks x ~" + CONFIG.chunkSize);
+  // 分 chunk 翻譯，失敗時拆半重試
+  const translatedUnique = await translateWithRetry(uniqueTexts, CONFIG.chunkSize);
 
-  const chunkResults = await Promise.all(chunks.map(c => callOpenAI(c)));
-  const translatedUnique = [].concat(...chunkResults);
-
-  // 還原順序；CC 標記直接回傳空字串（不顯示）
+  // 還原順序；CC 標記直接回傳空字串
   return texts.map(t => {
     const key = normalizeKey(t);
     if (!key) return "";
-    if (isCCOnly(key)) return "";  // 純 CC 標記不顯示翻譯
+    if (isCCOnly(key)) return "";
     const idx = uniqueMap[key];
     return idx !== undefined ? (translatedUnique[idx] || "") : "";
   });
 }
 
-function callOpenAI(textArray) {
+// 遞迴拆半重試：chunk 長度不符時，分兩半分別重試，直到 chunkSize=1
+async function translateWithRetry(texts, chunkSize) {
+  const result = new Array(texts.length).fill("");
+
+  async function processRange(arr, offset) {
+    if (arr.length === 0) return;
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += chunkSize) {
+      chunks.push({ texts: arr.slice(i, i + chunkSize), offset: offset + i });
+    }
+    await Promise.all(chunks.map(async c => {
+      const translated = await callOpenAISingle(c.texts);
+      if (translated !== null) {
+        // 成功：填入結果
+        for (let j = 0; j < translated.length; j++) {
+          result[c.offset + j] = translated[j];
+        }
+      } else if (chunkSize > 1) {
+        // 失敗：拆半重試
+        const half = Math.ceil(c.texts.length / 2);
+        console.log("[Dualsub] Retry chunk size " + chunkSize + " → " + half);
+        await processRange(c.texts.slice(0, half), c.offset);
+        await processRange(c.texts.slice(half), c.offset + half);
+      }
+      // chunkSize=1 還失敗就放空（罕見）
+    }));
+  }
+
+  await processRange(texts, 0);
+  return result;
+}
+
+// 回傳 string[] 或 null（長度不符/錯誤時）
+function callOpenAISingle(textArray) {
   return new Promise(resolve => {
     const lines = textArray.map((t, i) => `${i + 1}. ${t}`).join("\n");
     const prompt = `You are a subtitle translator. Each numbered line is a timed subtitle cue.\n\nReturn ONLY a JSON object: {"t": ["trans1", "trans2", ...]} with EXACTLY ${textArray.length} elements.\nArray index 0 = line 1. Never merge lines. Translate fragments as-is.\nTarget language: ${CONFIG.targetLang}\n\n${lines}`;
@@ -247,7 +259,7 @@ function callOpenAI(textArray) {
     }, (error, response, data) => {
       if (error || !response || response.status !== 200) {
         console.log("[Dualsub] OpenAI err: " + (error || (response && response.status)));
-        resolve(new Array(textArray.length).fill(""));
+        resolve(null);
         return;
       }
       try {
@@ -256,17 +268,16 @@ function callOpenAI(textArray) {
         const arr = parsed.t || parsed.translations || [];
         console.log("[Dualsub] Translated " + arr.length + "/" + textArray.length);
 
-        // 嚴格長度驗證：長度不對 = GPT 有 merge，整批丟棄避免 shift
         if (!Array.isArray(arr) || arr.length !== textArray.length) {
-          console.log("[Dualsub] Array length mismatch, discarding batch.");
-          resolve(new Array(textArray.length).fill(""));
+          console.log("[Dualsub] Length mismatch (" + arr.length + " vs " + textArray.length + "), will retry smaller.");
+          resolve(null);
           return;
         }
 
         resolve(arr.map(v => (typeof v === "string" ? v.trim() : "")));
       } catch (e) {
         console.log("[Dualsub] Parse err: " + e.message);
-        resolve(new Array(textArray.length).fill(""));
+        resolve(null);
       }
     });
   });
@@ -302,3 +313,4 @@ function simpleHash(str) {
   for (let i = 0; i < Math.min(str.length, 128); i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
   return Math.abs(h).toString(16);
 }
+
