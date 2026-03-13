@@ -1,25 +1,21 @@
 /**
- * Netflix OpenAI Dualsub v2.3
+ * Netflix OpenAI Dualsub v2.4
  * Surge iOS Script (http-response)
  *
  * 功能：
  *   - 攔截 Netflix VTT/TTML 字幕
- *   - 用 OpenAI / Grok 翻譯成繁體中文（或指定語言）
+ *   - 用 OpenAI 翻譯成繁體中文（或指定語言）
  *   - 原文在上、譯文在下（或反過來，可設定）
  *   - $persistentStore 快取 24 小時，避免重複計費
  *
  * Module Arguments（sgmodule 設定）：
- *   ApiKey    — API Key（OpenAI: sk-... / Grok: xai-...）
- *   Provider  — openai（預設）| grok
- *   Model     — 翻譯模型，預設依 Provider 自動選
+ *   ApiKey    — OpenAI API Key（sk-...）
+ *   Model     — 翻譯模型，預設 gpt-4o-mini
  *   Position  — original_top（原文在上）| translation_top（譯文在上）
  *   Language  — 目標語言，預設 繁體中文
  */
 
-const PROVIDER_ENDPOINTS = {
-  openai: "https://api.openai.com/v1/chat/completions",
-  grok:   "https://api.x.ai/v1/chat/completions",
-};
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 
 // 優先從 Module Arguments ($argument) 讀取，fallback 到 $persistentStore（BoxJs）
 function parseArguments() {
@@ -40,29 +36,21 @@ function parseArguments() {
 
 const _args = parseArguments();
 
-const _provider = (_args["Provider"] || $persistentStore.read("subtitle_provider") || "openai").toLowerCase();
-
 const CONFIG = {
   apiKey:
     _args["ApiKey"] ||
-    _args["openai_api_key"] ||
     $persistentStore.read("openai_api_key") ||
     "",
-  provider: _provider,
-  apiUrl: PROVIDER_ENDPOINTS[_provider] || PROVIDER_ENDPOINTS["openai"],
   model:
     _args["Model"] ||
-    _args["openai_model"] ||
     $persistentStore.read("openai_model") ||
-    (_provider === "grok" ? "grok-3-mini-fast" : "gpt-4o-mini"),
+    "gpt-4o-mini",
   position:
     _args["Position"] ||
-    _args["subtitle_position"] ||
     $persistentStore.read("subtitle_position") ||
     "original_top",
   targetLang:
     _args["Language"] ||
-    _args["target_language"] ||
     $persistentStore.read("target_language") ||
     "繁體中文",
   cacheExpireMs: 24 * 60 * 60 * 1000, // 24 hours
@@ -74,7 +62,7 @@ const CONFIG = {
 (async () => {
   try {
     if (!CONFIG.apiKey) {
-      console.log("[Netflix-Dualsub] No API key set (Provider: " + CONFIG.provider + "). Pass-through.");
+      console.log("[Netflix-Dualsub] No API key set. Pass-through.");
       $done({});
       return;
     }
@@ -97,7 +85,6 @@ const CONFIG = {
     }
 
     let result;
-    const contentType = ($response.headers["Content-Type"] || "").toLowerCase();
 
     if (body.trimStart().startsWith("WEBVTT") || url.includes(".vtt")) {
       result = await processVTT(body);
@@ -356,7 +343,7 @@ ${numbered}`;
 
     $httpClient.post(
       {
-        url: CONFIG.apiUrl,
+        url: OPENAI_API_URL,
         headers: {
           "Content-Type": "application/json",
           Authorization: "Bearer " + CONFIG.apiKey,
