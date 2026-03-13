@@ -1,5 +1,5 @@
 /**
- * Netflix OpenAI Dualsub v2.1
+ * Netflix OpenAI Dualsub v2.6
  * Surge iOS Script (http-response)
  *
  * 核心策略（參考 Neurogram-R）：
@@ -11,6 +11,9 @@
  *   - 拆行合併改 while loop，正確處理 3+ 行字幕
  *   - 純 CC 標記（[MUSIC] / [APPLAUSE] 等）不送翻譯，直接保留原文
  *   - 去重 key normalize（trim + 壓縮空白），避免空白差異造成重複翻譯
+ *
+ * v2.6 變更：
+ *   - VTT 插入改用位置索引（從後往前），完全避免 string.replace 搜尋位置偏移問題
  */
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -94,7 +97,7 @@ const CC_ONLY_RE = /^\s*\[([^\]]+)\]\s*$/;
   }
 })();
 
-// ─── VTT — regex insert (Neurogram style) ─────────────────────────────────────
+// ─── VTT — position-based insert ──────────────────────────────────────────────
 
 async function processVTT(body) {
   body = body.replace(/\r/g, "");
@@ -107,32 +110,43 @@ async function processVTT(body) {
     body = body.replace(multiLineRe, "$1 $2");
   } while (body !== prev);
 
-  // 抓所有 timeline（含字幕文字）
+  // 抓所有 cue，記錄在 body 中的實際位置
   const dialogueRe = /(\d+:\d\d:\d\d[.,]\d{3} --> \d+:\d\d:\d\d[.,]\d[^\n]*\n)([^\n]+)/g;
   const dialogues = [];
   let m;
   while ((m = dialogueRe.exec(body)) !== null) {
-    dialogues.push({ timing: m[1], text: m[2], raw: stripVTTTags(m[2]) });
+    dialogues.push({
+      timing:     m[1],
+      text:       m[2],
+      raw:        stripVTTTags(m[2]),
+      matchStart: m.index,
+      matchEnd:   m.index + m[0].length,
+    });
   }
 
   if (dialogues.length === 0) return null;
   console.log("[Dualsub] VTT dialogues: " + dialogues.length);
 
-  // 去重翻譯（CC 標記直接給空字串，不送 OpenAI）
   const translations = await translateDedup(dialogues.map(d => d.raw));
 
-  // 插入譯文（不重建，直接 replace）
+  // 建立插入點列表
+  const inserts = [];
   for (let i = 0; i < dialogues.length; i++) {
     const trans = translations[i];
     if (!trans) continue;
-    const original = dialogues[i].timing + dialogues[i].text;
-    let replacement;
     if (CONFIG.position === "translation_top") {
-      replacement = dialogues[i].timing + trans + "\n" + dialogues[i].text;
+      // 在 timing 行之後、原文之前插入譯文
+      inserts.push({ pos: dialogues[i].matchStart + dialogues[i].timing.length, text: trans + "\n" });
     } else {
-      replacement = original + "\n" + trans;
+      // 在原文之後插入譯文
+      inserts.push({ pos: dialogues[i].matchEnd, text: "\n" + trans });
     }
-    body = body.replace(original, replacement);
+  }
+
+  // 從後往前插入，確保位置不偏移
+  inserts.sort((a, b) => b.pos - a.pos);
+  for (const ins of inserts) {
+    body = body.substring(0, ins.pos) + ins.text + body.substring(ins.pos);
   }
 
   return body;
