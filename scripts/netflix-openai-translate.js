@@ -1,5 +1,5 @@
 /**
- * Netflix OpenAI Dualsub v2.4
+ * Netflix OpenAI Dualsub v2.5
  * Surge iOS Script (http-response)
  *
  * 功能：
@@ -54,7 +54,7 @@ const CONFIG = {
     $persistentStore.read("target_language") ||
     "繁體中文",
   cacheExpireMs: 24 * 60 * 60 * 1000, // 24 hours
-  batchSize: 15, // lines per API call — smaller = better alignment from AI
+  batchSize: 60, // lines per parallel chunk — must complete within Surge 30s timeout
 };
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -302,23 +302,40 @@ async function processTTML(body) {
 // ─── OpenAI Translation ───────────────────────────────────────────────────────
 
 async function translateBatch(texts) {
-  const results = new Array(texts.length).fill("");
-  const batches = [];
-
-  for (let i = 0; i < texts.length; i += CONFIG.batchSize) {
-    batches.push(texts.slice(i, i + CONFIG.batchSize));
-  }
-
-  let offset = 0;
-  for (const batch of batches) {
-    const translated = await callOpenAI(batch);
-    for (let j = 0; j < translated.length; j++) {
-      results[offset + j] = translated[j];
+  // Deduplicate to save tokens
+  const uniqueMap = {};
+  const uniqueList = [];
+  texts.forEach(t => {
+    const key = t.trim();
+    if (key && !uniqueMap.hasOwnProperty(key)) {
+      uniqueMap[key] = uniqueList.length;
+      uniqueList.push(key);
     }
-    offset += batch.length;
+  });
+
+  if (uniqueList.length === 0) return new Array(texts.length).fill("");
+  if (uniqueList.length > 500) {
+    console.log("[Netflix-Dualsub] Too many cues (" + uniqueList.length + "), pass-through.");
+    return new Array(texts.length).fill("");
   }
 
-  return results;
+  // Split into chunks and translate in parallel
+  const chunks = [];
+  for (let i = 0; i < uniqueList.length; i += CONFIG.batchSize) {
+    chunks.push(uniqueList.slice(i, i + CONFIG.batchSize));
+  }
+  console.log("[Netflix-Dualsub] " + uniqueList.length + " unique cues → " + chunks.length + " chunks (parallel)");
+
+  const chunkResults = await Promise.all(chunks.map(c => callOpenAI(c)));
+  const translatedUnique = [].concat(...chunkResults);
+
+  // Map back to original order
+  return texts.map(t => {
+    const key = t.trim();
+    if (!key) return "";
+    const idx = uniqueMap[key];
+    return idx !== undefined ? (translatedUnique[idx] || "") : "";
+  });
 }
 
 function callOpenAI(textArray) {
